@@ -1,0 +1,3 @@
+[submodule "libcutils4ndk"]
+	path = libcutils4ndk
+	url = https://github.com/cerg2010cerg2010/libcutils4ndk
