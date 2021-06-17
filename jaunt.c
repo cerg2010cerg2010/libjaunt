@@ -42,6 +42,19 @@ void (*exec)(
     uint32_t *fpexc,
     int dump_reg);
 
+void sig_handler(int signal, siginfo_t *info, void *context);
+
+union {
+	void (*ill_sigaction) (int signal, siginfo_t *info, void *context);
+	void (*ill_handler)(int signal);
+} ill_handlers;
+char ill_is_siginfo;
+
+struct sigaction old_sa, new_sa = {
+	.sa_flags     = SA_SIGINFO,
+	.sa_sigaction = &sig_handler
+};
+
 int (*orig_sigaction)(int signum, const struct sigaction *act,
 		struct sigaction *oldact);
 
@@ -55,7 +68,28 @@ sighandler_t bsd_signal(int signum, sighandler_t handler)
 	/* Ignore other signal handlers */
 	if (signum == SIGILL)
 	{
-		return NULL;
+		sighandler_t ret;
+		if (ill_is_siginfo)
+		{
+			/* idk */
+			ret = SIG_DFL;
+		}
+		else
+		{
+			ret = ill_handlers.ill_handler;
+		}
+
+		ill_is_siginfo = 0;
+		if (handler == SIG_DFL || handler == SIG_ERR)
+		{
+			ill_handlers.ill_handler = NULL;
+		}
+		else
+		{
+			ill_handlers.ill_handler = handler;
+		}
+
+		return ret;
 	}
 
 	return orig_signal(signum, handler);
@@ -65,9 +99,36 @@ __attribute__ ((visibility ("default")))
 int sigaction(int signum, const struct sigaction *act,
 		struct sigaction *oldact)
 {
-	/* Ignore other signal handlers */
 	if (signum == SIGILL)
 	{
+		if (oldact != NULL)
+		{
+			memset((void*)oldact, 0, sizeof(*oldact));
+			if (ill_is_siginfo)
+			{
+				oldact->sa_flags = SA_SIGINFO;
+				oldact->sa_sigaction = ill_handlers.ill_sigaction;
+			}
+			else
+			{
+				oldact->sa_flags = 0;
+				oldact->sa_handler = ill_handlers.ill_handler;
+			}
+		}
+
+		if (act != NULL)
+		{
+			if (act->sa_flags & SA_SIGINFO)
+			{
+				ill_is_siginfo = 1;
+				ill_handlers.ill_sigaction = act->sa_sigaction;
+			}
+			else
+			{
+				ill_is_siginfo = 0;
+				ill_handlers.ill_handler = act->sa_handler ? act->sa_handler : SIG_DFL;
+			}
+		}
 		return 0;
 	}
 
@@ -111,12 +172,11 @@ void init_arm_tcg_lib(void)
 	pthread_mutex_unlock(&mutex);
 }
 
-inline int check_vfp_magic(struct vfp_sigframe *vfp) {
+static inline int check_vfp_magic(struct vfp_sigframe *vfp) {
 	return vfp->magic == VFP_MAGIC;
 }
 
 void sig_handler(int signal, siginfo_t *info, void *context) {
-	(void) info;
 	struct sigcontext *uc_mcontext = &((ucontext_t*)context)->uc_mcontext;
 	struct aux_sigframe *aux = (struct aux_sigframe*)&((ucontext_t*)context)->uc_regspace;
 	struct vfp_sigframe *vfp = (struct vfp_sigframe*)aux;
@@ -362,6 +422,8 @@ void sig_handler(int signal, siginfo_t *info, void *context) {
 		}
 	}
 
+	unsigned long prev_pc = uc_mcontext->arm_pc;
+
 	exec(
 		(uint32_t*)&uc_mcontext->arm_r0,
 		(uint64_t*)vfp->ufp.fpregs,
@@ -369,11 +431,39 @@ void sig_handler(int signal, siginfo_t *info, void *context) {
 		(uint32_t*)&vfp->ufp.fpscr,
 		(uint32_t*)&vfp->ufp_exc.fpexc,
 		0);
-}
 
-struct sigaction old_sa, new_sa = {
-	.sa_flags     = SA_SIGINFO,
-	.sa_sigaction = &sig_handler };
+	/* No NEON instructions was found - abort execution */
+	if (unlikely(prev_pc == uc_mcontext->arm_pc))
+	{
+		/* Invoke the saved signal handler */
+		if (ill_is_siginfo)
+		{
+			if (ill_handlers.ill_sigaction == NULL)
+			{
+				/* We will return to the same instruction where
+				 * fault happed, so signal will be raised again */
+				orig_signal(signal, SIG_DFL);
+				return;
+			}
+
+			ill_handlers.ill_sigaction(signal, info, context);
+		}
+		else
+		{
+			if (ill_handlers.ill_handler == NULL)
+			{
+				orig_signal(signal, SIG_DFL);
+				return;
+			}
+			else if (ill_handlers.ill_handler == SIG_IGN)
+			{
+				return;
+			}
+
+			ill_handlers.ill_handler(signal);
+		}
+	}
+}
 
 static void *handle;
 void __attribute__ ((constructor)) init(void) {
